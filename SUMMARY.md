@@ -146,3 +146,13 @@ High-level summary of what each script/module does, how the reconstruction pipel
 - Caches: Intermediate clustering/semantics are saved in `.pkl`/`.npy` files to speed re-runs.
 - Graph save/load: Per-plant fitted parameters live under `.../params/graph.pkl` (and `.../params/info/`). `decode.py` consumes these for mesh generation.
 
+# Zander Commands
+Variation test bench example:
+```bash
+ python variation_testbench.py --species soybean \                                    --output_root variation_batches \
+    --variations_per_batch 3 --num_batches 4 \
+    --stem_scale_start 0.6 --stem_scale_step 0.2 \
+    --leaf_deform_scale_start 0.5 --leaf_deform_scale_step 0.25 \
+    --leaf_shape_scale_start 0.4 --leaf_shape_scale_step 0.2 \
+    --output_type color_mesh --align_global
+```

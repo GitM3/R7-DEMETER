@@ -1,5 +1,6 @@
 import argparse
 import os
+from datetime import datetime
 from typing import Dict, Tuple
 
 import numpy as np
@@ -7,11 +8,28 @@ import open3d as o3d
 import torch
 
 from representation.graph import PlantGraphFixedTopology
+from utils.constant import FLOWER_CLASS, FRUIT_CLASS, LEAF_CLASS, STEM_CLASS
 from utils.graph import load_class, load_parent
 from utils.pca import NodePCA
 
+CLASS_COLOR_MAP = {
+    STEM_CLASS: (0.55, 0.33, 0.1),
+    LEAF_CLASS: (0.12, 0.6, 0.2),
+    FLOWER_CLASS: (0.9, 0.4, 0.7),
+    FRUIT_CLASS: (0.3, 0.6, 0.2),
+}
 
-def _load_graph(data_folder: str, species: str, sample_name: str) -> Tuple[PlantGraphFixedTopology, Dict[str, NodePCA]]:
+CLASS_NAME_MAP = {
+    STEM_CLASS: "stem",
+    LEAF_CLASS: "leaf",
+    FLOWER_CLASS: "flower",
+    FRUIT_CLASS: "fruit",
+}
+
+
+def _load_graph(
+    data_folder: str, species: str, sample_name: str
+) -> Tuple[PlantGraphFixedTopology, Dict[str, NodePCA], Dict[str, int]]:
     """Load a fitted graph together with the PCA models for the given species."""
     instance_folder = os.path.join(data_folder, species, "instances", sample_name)
     if not os.path.isdir(instance_folder):
@@ -39,7 +57,7 @@ def _load_graph(data_folder: str, species: str, sample_name: str) -> Tuple[Plant
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     plant_graph.to(device)
 
-    return plant_graph, pca_models
+    return plant_graph, pca_models, classes
 
 
 def _sample_coefficients(
@@ -128,9 +146,34 @@ def save_mesh(mesh: o3d.geometry.TriangleMesh, path: str) -> None:
     o3d.io.write_triangle_mesh(path, mesh, write_ascii=False, compressed=False)
 
 
+def _merge_with_class_colors(
+    meshes: Dict[str, o3d.geometry.TriangleMesh], classes: Dict[str, int]
+) -> o3d.geometry.TriangleMesh:
+    merged = None
+    for node_id, mesh in meshes.items():
+        class_idx = classes.get(str(node_id))
+        color = CLASS_COLOR_MAP.get(class_idx, (0.7, 0.7, 0.7))
+        mesh.paint_uniform_color(color)
+        merged = mesh if merged is None else merged + mesh
+    return merged
+
+
+def _export_instance_meshes(
+    meshes: Dict[str, o3d.geometry.TriangleMesh],
+    classes: Dict[str, int],
+    destination: str,
+) -> None:
+    os.makedirs(destination, exist_ok=True)
+    for node_id, mesh in meshes.items():
+        class_idx = classes.get(str(node_id))
+        class_name = CLASS_NAME_MAP.get(class_idx, f"class_{class_idx}")
+        filename = f"{node_id}_{class_name}.ply"
+        save_mesh(mesh, os.path.join(destination, filename))
+
+
 def generate_variations(args: argparse.Namespace) -> None:
     rng = np.random.default_rng(args.seed)
-    plant_graph, pca_models = _load_graph(args.data_folder, args.species, args.sample_name)
+    plant_graph, pca_models, classes = _load_graph(args.data_folder, args.species, args.sample_name)
     if args.draw_graph:
         plant_graph.draw_topology()
 
@@ -148,24 +191,46 @@ def generate_variations(args: argparse.Namespace) -> None:
         )
 
         with torch.no_grad():
-            mesh = plant_graph.generate(
-                output_format="mesh",
-                color=args.color,
-                align_global=args.align_global,
-            )
-
-        if args.visualize:
-            axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.01)
-            o3d.visualization.draw_geometries([mesh, axis], mesh_show_back_face=True)
-
-        output_name = f"{args.sample_name}_variation_{idx:02d}.ply"
-        save_mesh(mesh, os.path.join(args.output_dir, output_name))
+            if args.output_type == "mesh":
+                mesh = plant_graph.generate(
+                    output_format="mesh",
+                    color=args.color,
+                    align_global=args.align_global,
+                )
+                output_name = f"{args.output_prepend}_{args.sample_name}_variation_{idx:02d}.ply"
+                save_mesh(mesh, os.path.join(args.output_dir, output_name))
+                if args.visualize:
+                    axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.01)
+                    o3d.visualization.draw_geometries([mesh, axis], mesh_show_back_face=True)
+            else:
+                meshes = plant_graph.generate(
+                    output_format="instance_mesh",
+                    color=args.color,
+                    align_global=args.align_global,
+                )
+                if args.output_type == "color_mesh":
+                    mesh = _merge_with_class_colors(meshes, classes)
+                    output_name = f"{args.output_prepend}_color_{args.sample_name}_variation_{idx:02d}_color.ply"
+                    save_mesh(mesh, os.path.join(args.output_dir, output_name))
+                    if args.visualize:
+                        axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.01)
+                        o3d.visualization.draw_geometries([mesh, axis], mesh_show_back_face=True)
+                elif args.output_type == "instance_mesh":
+                    inst_dir = os.path.join(
+                        args.output_dir, f"{args.output_prepend}_{args.sample_name}_variation_{idx:02d}", "instances"
+                    )
+                    _export_instance_meshes(meshes, classes, inst_dir)
+                    if args.visualize:
+                        o3d.visualization.draw_geometries(
+                            list(meshes.values()), mesh_show_back_face=True
+                        )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate random Demeter variations by sampling PCA coefficients."
     )
+    today = datetime.now().strftime("%Y%m%d")
     parser.add_argument("--data_folder", type=str, default="sample_params")
     parser.add_argument("--species", type=str, default="soybean")
     parser.add_argument("--sample_name", type=str, required=True, help="Base instance to copy topology from.")
@@ -181,11 +246,24 @@ def parse_args() -> argparse.Namespace:
         default="mean",
         help="Sample around the PCA mean or perturb the fitted instance coefficients.",
     )
+    parser.add_argument(
+        "--output_type",
+        type=str,
+        choices=("mesh", "color_mesh", "instance_mesh"),
+        default="mesh",
+        help="Switch between a merged mesh, merged per-class colors, or separate instance meshes.",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Seeds the RNG for repeatable sampling.")
     parser.add_argument("--align_global", action="store_true", help="Align the main stem to the global axis.")
     parser.add_argument("--draw_graph", action="store_true", help="Print plant hierarchy information.")
     parser.add_argument("--visualize", action="store_true", help="Open an interactive viewer for each variation.")
-    parser.add_argument("--color", type=str, default="gray", help="Mesh color mode used by PlantGraph.generate.")
+    parser.add_argument("--color", type=str, default="gray", help="Mesh color mode passed to PlantGraph.generate.")
+    parser.add_argument(
+        "--output_prepend",
+        type=str,
+        default=today,
+        help="Prefix prepended to every exported variation (default: today's date, YYYYMMDD).",
+    )
     return parser.parse_args()
 
 
