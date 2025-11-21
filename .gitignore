@@ -6,3 +6,5 @@ variation_output/*
 variation_batches/*
 *.ply
 **/*.ply
+*.blend
+*.blend1
