@@ -53,6 +53,9 @@ def decode_params(data_folder:str, sample_name:str, species:str='soybean', **kwa
                 attach_uv_to_grid_mesh(m, (plant_graph.leaf_w, plant_graph.leaf_h), flip_v=True)
                 img = o3d.io.read_image(leaf_texture_path)
                 m.textures = [img]
+                # Ensure material ids exist so Open3D doesn't crash when sampling textures
+                if len(m.triangle_material_ids) == 0:
+                    m.triangle_material_ids = o3d.utility.IntVector(np.zeros(len(m.triangles), dtype=np.int32))
 
         # Visualize all instance meshes together
         axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.01)

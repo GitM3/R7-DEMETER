@@ -72,7 +72,14 @@ def attach_uv_to_grid_mesh(mesh: o3d.geometry.TriangleMesh, grid_shape: Tuple[in
     """Attach canonical UVs to an existing grid mesh with known [m,n] shape."""
     m, n = grid_shape
     faces = np.asarray(mesh.triangles)
+    if faces.size == 0:
+        raise ValueError("Mesh has no triangles; cannot attach UVs")
     v_uvs = _grid_vertex_uvs(m, n, flip_v=flip_v)
     tri_uvs = _expand_triangle_uvs(faces, v_uvs)
+    expected = len(faces) * 3
+    if len(tri_uvs) != expected:
+        raise ValueError(f"UV count {len(tri_uvs)} does not match triangle corners {expected} for grid {m}x{n}")
     mesh.triangle_uvs = o3d.utility.Vector2dVector(tri_uvs)
-
+    # Open3D expects one material id per triangle when textures are present.
+    if len(mesh.triangle_material_ids) != len(faces):
+        mesh.triangle_material_ids = o3d.utility.IntVector(np.zeros(len(faces), dtype=np.int32))
