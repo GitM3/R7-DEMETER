@@ -31,7 +31,7 @@ def decode_params(data_folder:str, sample_name:str, species:str='soybean', **kwa
     plant_graph.cuda()
 
     # draw graph structure
-    if kwargs.get('draw_graph', False):
+    if kwargs.get('draw_graph', True):
         plant_graph.draw_topology()
 
     with torch.no_grad():
@@ -40,7 +40,7 @@ def decode_params(data_folder:str, sample_name:str, species:str='soybean', **kwa
 
     axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.01)
     axis.translate([0, 0, 0])
-    o3d.io.write_triangle_mesh("./output.ply",mesh,print_progress=True)
+    # o3d.io.write_triangle_mesh("./output.ply",mesh,print_progress=True)
     o3d.visualization.draw_geometries([mesh, axis], mesh_show_back_face=True)
 
 if __name__ == "__main__":

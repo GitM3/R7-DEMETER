@@ -33,6 +33,16 @@ from utils.pca import NodePCA
 from utils.constant import LEAF_CLASS, STEM_CLASS, FLOWER_CLASS, FRUIT_CLASS
 
 
+def _cycle_node_id(order: List[str], current_id: str, step: int) -> str:
+    """Return the next valid node id while guarding against empty/missing lists."""
+    if not order:
+        return current_id
+    if current_id not in order:
+        return order[0]
+    idx = (order.index(current_id) + step) % len(order)
+    return order[idx]
+
+
 def _instance_paths(data_folder: str, species: str, sample_name: str):
     base = os.path.join(data_folder, species, "instances", sample_name)
     info = os.path.join(base, "info")
@@ -72,6 +82,24 @@ def _node_order_for_edit_id(g: PlantGraphFixedTopology) -> List[str]:
     return order
 
 
+def _update_camera_focus(vis: o3d.visualization.Visualizer, state: dict, bbox: o3d.geometry.AxisAlignedBoundingBox):
+    if bbox is None:
+        return
+    vc = vis.get_view_control()
+    # Cache reference zoom/scene size the first time we focus.
+    if "base_zoom" not in state:
+         state["base_zoom"] = 1
+    diag = float(np.linalg.norm(bbox.get_extent()))
+    if diag <= 1e-6:
+        diag = 1e-6
+    if "scene_diag" not in state:
+        state["scene_diag"] = diag
+    vc.set_lookat(bbox.get_center().tolist())
+    zoom_scale = np.clip(state.get("scene_diag", diag) / diag, 0.25, 4.0)
+    target_zoom = float(state.get("base_zoom", 1) * zoom_scale)
+    vc.set_zoom(float(np.clip(target_zoom, 0.02, 2.5)))
+
+
 def _regenerate_mesh(vis: o3d.visualization.Visualizer, state: dict, highlight_id: str):
     g: PlantGraphFixedTopology = state["graph"]
     color = state["color"]
@@ -79,7 +107,17 @@ def _regenerate_mesh(vis: o3d.visualization.Visualizer, state: dict, highlight_i
     # Map node id to edit_id index
     edit_id = node_order.index(highlight_id) if highlight_id in node_order else -1
     with torch.no_grad():
-        mesh = g.generate(output_format="mesh", color=color, align_global=True, edit_id=edit_id)
+        mesh_dict, _, _, _ = g.generate(
+            output_format="instance_mesh_full",
+            color=color,
+            align_global=True,
+            edit_id=edit_id,
+        )
+    mesh = None
+    for geom in mesh_dict.values():
+        mesh = geom if mesh is None else mesh + geom
+    if mesh is None:
+        return
     if state.get("mesh") is not None:
         try:
             vis.remove_geometry(state["mesh"], reset_bounding_box=False)
@@ -88,6 +126,20 @@ def _regenerate_mesh(vis: o3d.visualization.Visualizer, state: dict, highlight_i
     state["mesh"] = mesh
     vis.add_geometry(mesh, reset_bounding_box=False)
     vis.update_geometry(mesh)
+
+    if mesh is not None and "scene_diag" not in state:
+        bbox = mesh.get_axis_aligned_bounding_box()
+        state["scene_diag"] = float(max(np.linalg.norm(bbox.get_extent()), 1e-6))
+
+    focus_bbox = None
+    if highlight_id in mesh_dict:
+        focus_bbox = mesh_dict[highlight_id].get_axis_aligned_bounding_box()
+    elif mesh is not None:
+        focus_bbox = mesh.get_axis_aligned_bounding_box()
+    if highlight_id != state.get("last_focus_id"):
+        _update_camera_focus(vis, state, focus_bbox)
+        state["last_focus_id"] = highlight_id
+
     vis.poll_events()
     vis.update_renderer()
 
@@ -190,6 +242,7 @@ def main():
         "parents": edict(dict(parents)),
         "color": args.color,
         "mesh": None,
+        "last_focus_id": None,
     }
     state["node_order"] = _node_order_for_edit_id(g)
     current_id = state["node_order"][0] if state["node_order"] else list(classes.keys())[0]
@@ -210,8 +263,7 @@ def main():
         order = state["node_order"]
         if not order:
             return False
-        idx = (order.index(current_id) - 1) % len(order)
-        current_id = order[idx]
+        current_id = _cycle_node_id(order, current_id, -1)
         print(f"Selected node: {current_id}")
         _regenerate_mesh(vis, state, current_id)
         return False
@@ -221,8 +273,7 @@ def main():
         order = state["node_order"]
         if not order:
             return False
-        idx = (order.index(current_id) + 1) % len(order)
-        current_id = order[idx]
+        current_id = _cycle_node_id(order, current_id, 1)
         print(f"Selected node: {current_id}")
         _regenerate_mesh(vis, state, current_id)
         return False
@@ -314,4 +365,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

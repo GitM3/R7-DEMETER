@@ -611,9 +611,21 @@ class PlantGraphFixedTopology(nn.Module):
         checkpoint = torch.load(path, map_location='cpu', weights_only=True)
         model_dict = self.state_dict()
 
+        # remember current device so newly registered parameters can be moved later
+        target_device = None
+        for param in self.parameters(recurse=False):
+            target_device = param.device
+            break
+        if target_device is None:
+            for buf in self.buffers():
+                target_device = buf.device
+                break
+
         for k, v in checkpoint.items():
             if k not in model_dict:
                 self.register_parameter(k, torch.nn.Parameter(v))
 
-        # Now reload all keys
         self.load_state_dict(checkpoint, strict=False)
+
+        if target_device is not None:
+            self.to(target_device)
