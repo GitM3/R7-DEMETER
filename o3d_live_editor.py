@@ -124,7 +124,8 @@ def _regenerate_mesh(vis: o3d.visualization.Visualizer, state: dict, highlight_i
         except Exception:
             pass
     state["mesh"] = mesh
-    vis.add_geometry(mesh, reset_bounding_box=False)
+    # On first add, reset bounding box so the camera near/far planes fit the mesh
+    vis.add_geometry(mesh, reset_bounding_box=is_first_mesh)
     vis.update_geometry(mesh)
 
     if mesh is not None and "scene_diag" not in state:
@@ -249,9 +250,25 @@ def main():
 
     vis = o3d.visualization.VisualizerWithKeyCallback()
     vis.create_window(window_name="Demeter Live Editor", width=1280, height=960)
+    # Improve visibility for thin meshes/leaves and avoid back-face culling surprises
+    try:
+        opt = vis.get_render_option()
+        opt.mesh_show_back_face = True
+    except Exception:
+        pass
     axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.01)
     vis.add_geometry(axis)
     _regenerate_mesh(vis, state, current_id)
+
+    # Try to push camera clipping planes further out to avoid distance clipping
+    try:
+        ctr = vis.get_view_control()
+        if hasattr(ctr, "set_constant_z_far"):
+            ctr.set_constant_z_far(1e6)
+        if hasattr(ctr, "set_constant_z_near"):
+            ctr.set_constant_z_near(1e-4)
+    except Exception:
+        pass
 
     def print_help():
         print("\nKeys: [ prev, ] next, +/- scale, K/L length -, +, D duplicate, C color, S save, H help, Q quit\n")

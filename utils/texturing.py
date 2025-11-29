@@ -1,0 +1,78 @@
+import numpy as np
+import open3d as o3d
+from typing import Tuple
+
+
+def _grid_faces(m: int, n: int) -> np.ndarray:
+    """Generate triangle faces for an m x n grid, matching utils.pcd.grid_to_mesh."""
+    faces = []
+    for i in range(m - 1):
+        for j in range(n - 1):
+            v0 = i * n + j
+            v1 = v0 + 1
+            v2 = v0 + n
+            v3 = v2 + 1
+            faces.append([v0, v1, v3])
+            faces.append([v0, v3, v2])
+    return np.asarray(faces, dtype=np.int32)
+
+
+def _grid_vertex_uvs(m: int, n: int, flip_v: bool = True) -> np.ndarray:
+    """Return per-vertex UVs for an m x n grid: u=j/(n-1), v=i/(m-1).
+
+    By default v is flipped (1 - v) to match common image origin conventions.
+    """
+    us = np.linspace(0.0, 1.0, num=n)
+    vs = np.linspace(0.0, 1.0, num=m)
+    if flip_v:
+        vs = 1.0 - vs
+    U, V = np.meshgrid(us, vs)
+    uvs = np.stack([U, V], axis=-1).reshape(-1, 2)
+    return uvs.astype(np.float64)
+
+
+def _expand_triangle_uvs(faces: np.ndarray, vertex_uvs: np.ndarray) -> np.ndarray:
+    """Expand per-vertex UVs to per-triangle-corner UVs of shape [num_tris*3, 2]."""
+    tri_uvs = []
+    for f in faces:
+        tri_uvs.append(vertex_uvs[f[0]])
+        tri_uvs.append(vertex_uvs[f[1]])
+        tri_uvs.append(vertex_uvs[f[2]])
+    return np.asarray(tri_uvs, dtype=np.float64)
+
+
+def textured_mesh_from_grid(grid_xyz: np.ndarray, texture_path: str, flip_v: bool = True) -> o3d.geometry.TriangleMesh:
+    """Build a TriangleMesh from a [m,n,3] grid and attach UV + texture.
+
+    - UVs: canonical param mapping (u=j/(n-1), v=i/(m-1)), with optional vertical flip.
+    - Texture: loaded via Open3D `read_image`.
+    """
+    assert grid_xyz.ndim == 3 and grid_xyz.shape[-1] == 3, "grid must be [m,n,3]"
+    m, n, _ = grid_xyz.shape
+
+    vertices = grid_xyz.reshape(-1, 3)
+    faces = _grid_faces(m, n)
+    v_uvs = _grid_vertex_uvs(m, n, flip_v=flip_v)
+    tri_uvs = _expand_triangle_uvs(faces, v_uvs)
+
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    mesh.triangles = o3d.utility.Vector3iVector(faces)
+    mesh.triangle_uvs = o3d.utility.Vector2dVector(tri_uvs)
+
+    # Load texture
+    img = o3d.io.read_image(texture_path)
+    mesh.textures = [img]
+
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def attach_uv_to_grid_mesh(mesh: o3d.geometry.TriangleMesh, grid_shape: Tuple[int, int], flip_v: bool = True) -> None:
+    """Attach canonical UVs to an existing grid mesh with known [m,n] shape."""
+    m, n = grid_shape
+    faces = np.asarray(mesh.triangles)
+    v_uvs = _grid_vertex_uvs(m, n, flip_v=flip_v)
+    tri_uvs = _expand_triangle_uvs(faces, v_uvs)
+    mesh.triangle_uvs = o3d.utility.Vector2dVector(tri_uvs)
+

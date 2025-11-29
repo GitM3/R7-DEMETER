@@ -6,6 +6,7 @@ from utils.constant import *
 from representation.graph import PlantGraphFixedTopology
 from utils.pca import NodePCA
 from utils.graph import load_parent, load_class
+from utils.texturing import attach_uv_to_grid_mesh
     
 def decode_params(data_folder:str, sample_name:str, species:str='soybean', **kwargs):
 
@@ -34,14 +35,37 @@ def decode_params(data_folder:str, sample_name:str, species:str='soybean', **kwa
     if kwargs.get('draw_graph', True):
         plant_graph.draw_topology()
 
-    with torch.no_grad():
-        # align the plant to global X-axis to make it stand straight
-        mesh = plant_graph.generate(output_format='mesh', color='gray', align_global=True)
+    texturise = kwargs.get('texturise', False)
+    leaf_texture_path = kwargs.get('leaf_texture', None)
 
-    axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.01)
-    axis.translate([0, 0, 0])
-    # o3d.io.write_triangle_mesh("./output.ply",mesh,print_progress=True)
-    o3d.visualization.draw_geometries([mesh, axis], mesh_show_back_face=True)
+    if texturise:
+        if not leaf_texture_path or not os.path.isfile(leaf_texture_path):
+            raise FileNotFoundError("--texturise is set but --leaf_texture is missing or not a file")
+
+        with torch.no_grad():
+            meshes = plant_graph.generate(output_format='instance_mesh', color='gray', align_global=True)
+
+        # Attach UVs and texture only to leaf meshes
+        for node_id, m in list(meshes.items()):
+            cls = classes.get(str(node_id))
+            if cls == LEAF_CLASS:
+                # Add UVs for canonical grid and attach the same texture
+                attach_uv_to_grid_mesh(m, (plant_graph.leaf_w, plant_graph.leaf_h), flip_v=True)
+                img = o3d.io.read_image(leaf_texture_path)
+                m.textures = [img]
+
+        # Visualize all instance meshes together
+        axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.01)
+        o3d.visualization.draw_geometries(list(meshes.values()) + [axis], mesh_show_back_face=True)
+    else:
+        with torch.no_grad():
+            # align the plant to global X-axis to make it stand straight
+            mesh = plant_graph.generate(output_format='mesh', color='gray', align_global=True)
+
+        axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.01)
+        axis.translate([0, 0, 0])
+        o3d.io.write_triangle_mesh("./output.ply",mesh,print_progress=True)
+        o3d.visualization.draw_geometries([mesh, axis], mesh_show_back_face=True)
 
 if __name__ == "__main__":
 
@@ -53,6 +77,8 @@ if __name__ == "__main__":
     parser.add_argument('--sample_name', type=str, default=None, help='name of the sample to process')
     parser.add_argument('--species', type=str, default='soybean', help='species of the plant')
     parser.add_argument('--draw_graph', action='store_true', help='whether to draw the graph structure')
+    parser.add_argument('--texturise', action='store_true', help='apply a single texture to all leaf meshes (proof of concept)')
+    parser.add_argument('--leaf_texture', type=str, default=None, help='path to a leaf texture image (png/jpg) used when --texturise is set')
     args = parser.parse_args()
 
     data_folder = args.data_folder
@@ -60,7 +86,14 @@ if __name__ == "__main__":
     species = args.species
 
     if sample_name is not None:
-        decode_params(data_folder, sample_name, species)
+        decode_params(
+            data_folder,
+            sample_name,
+            species,
+            draw_graph=args.draw_graph,
+            texturise=args.texturise,
+            leaf_texture=args.leaf_texture,
+        )
         exit(0)
     
     # example usage 2

@@ -229,3 +229,57 @@ Variation test bench example:
 ## Summary
 - Usage: decode and reconstruction commands are confirmed above; PointTransformer inference is required for reconstruction.
 - Fruit support: constants and topology coloring exist, but geometry is skipped. To add fruit placeholders, wire fruit nodes into `PlantGraphFixedTopology.generate`, include them in `build_graph` length/orientation computations, and optionally add a simple centroid+radius placeholder during reconstruction. The file/function pointers above target the exact spots to change.
+
+## PCA Role In Generation (Deep Dive)
+- Purpose: PCA provides low-dimensional, species-level bases to reconstruct per-node geometry from compact coefficients.
+  - Stem 3D PCA: basis over Catmull–Rom curve control points; decoded to `[n_cp, 3]` local curve control points, then scaled/rotated and attached, finally meshed as cylinders.
+  - Leaf 2D PCA: basis over a flattened leaf template (2D grid). Coefficients (`shape_<id>`) modulate intrinsic 2D leaf outline; scaled by per-species `2d_leaf_pca_sigma.txt` during evaluation.
+  - Leaf 3D PCA: basis over 3D deformations on the mean 2D leaf. The decoded field is inverted to rotation parameters for `CatmullRomSurface` and applied to lift the 2D template into 3D.
+
+- Where it happens (generation):
+  - `representation/graph.PlantGraphFixedTopology.generate()` calls:
+    - `coeff_to_stem(deform_<id>)` → `pca_stem_3d.decode(...) → cp` → scale/rotate/attach → cylinder mesh.
+    - `coeff_to_leaf(shape_<id>, deform_<id>)` → `pca_leaf_3d.decode(...) → _surface.invert(...) → _surface.evaluate(..., shape_coeff=shape_<id>)` → scale/attach → grid mesh.
+  - Articulation is separate from PCA: `scale_<id>`, `M_quat_<id>` (orientation), `length_<id>` (attachment along parent stem) position parts in the plant frame.
+  - Thickness is explicit for stems (`thickness_<id>`) and is not part of PCA.
+
+- How node coefficients are obtained (reconstruction):
+  - In `representation/build_graph.build_plant_graph(...)` each fitted part is expressed in canonical local coordinates and encoded via the corresponding PCA:
+    - Stems: encode the local curve control points → `stem_3d_info_deform_coeff` → becomes `deform_<id>`.
+    - Leaves: encode the mean 3D grid → `leaf_3d_info_deform_coeff` (`deform_<id>`); the surface’s `dw` provides the 2D `leaf_3d_info_shape_coeff` (`shape_<id>`).
+  - These per-node coefficient tensors are registered as parameters on `PlantGraphFixedTopology`.
+
+- Scope of PCA models:
+  - PCA models are global per species, stored under `sample_params/<species>/` (`3d_stem_pca.pth`, `3d_leaf_pca.pth`, `2d_leaf_pca.pth`).
+  - There is no per-node or per-plant PCA “cluster”. Each node stores its own coefficient vector in the shared species PCA basis.
+  - `utils/pca.NodePCA` buffers include `data_mean`, `components`, and optionally `coeff_mean`/`coeff_std` (used by our variation tools for sampling).
+
+- Sampling / variation:
+  - `variation_decode.py` samples coefficients as `base + N(0, scale) * coeff_std`, where `base` is the PCA mean (`mean` strategy) or the fitted node’s current value (`perturb`).
+  - `graph_editor.py` mirrors this when adding a node: articulation is cloned from a source node, while PCA coefficients for the new node (stem `deform`, leaf `deform` + `shape`) are resampled.
+
+- Practical implications:
+  - Edit PCA coefficients to change intrinsic shape; edit articulation (scale/rotation/length) to change placement.
+  - If a PCA `.pth` lacks `coeff_mean/coeff_std`, decoding works but stochastic sampling should be avoided or the stats estimated offline.
+
+## Articulation Parameters (What, Where, How)
+- Parameters (per node, stored as Torch nn.Parameters on `PlantGraphFixedTopology`):
+  - `scale_<id>`: scalar size of the part; set from reconstruction as inverse of the fitted size (`1/s` during registration), then used directly in generation to scale decoded geometry.
+  - `M_quat_<id>`: local orientation as a quaternion; maps the node’s canonical geometry to its local frame before attachment.
+  - `length_<id>`: normalized attachment location along the parent stem curve in `[0,1]`; determines the offset point and local frame sampled on the parent.
+  - Stem‑only `thickness_<id>`: cylinder radius for meshing the stem curve (not part of PCA).
+
+- Where they are registered:
+  - `representation/graph.py` (constructor `PlantGraphFixedTopology.__init__`): registers `scale_<id>`, `M_quat_<id>`, and `length_<id>` for every non‑flower/fruit node; and `thickness_<id>` for stems.
+  - Source values come from `representation/build_graph.build_plant_graph(...)`, which computes per‑node `s` (size), local orientation `M_quat`, and `node_length_along_parent_stem` during graph assembly.
+
+- How they are applied at generation time:
+  - In `PlantGraphFixedTopology.generate(...)`:
+    - Parent attachment: `length_<id>` selects a point along the parent stem polyline via `interpolate_polyline(...)`; a Frenet frame is interpolated with quaternion SLERP to create `M_p` (the parent frame at that point).
+    - Local transform: decoded part geometry is first rotated by `M_quat_<id>`, then by the parent frame `M_p`, then scaled by `scale_<id>`, then translated by the sampled offset.
+    - Stem thickness: drawn as cylinders along the stem curve using `thickness_<id>` (clamped to a small minimum), see `generate_cylinder_along_curve_batch(...)`.
+
+- Thickness/tapering behavior (stems):
+  - There is no automatic distance‑based decay. Tapering arises from the learned/stored `thickness_<id>` per node, plus a constraint during fine‑tuning:
+    - In `PlantGraphFixedTopology.fit(..., mode='finetune')`, after optimization it enforces `thickness_child <= thickness_parent` (see lines near the post‑loop update), which encourages thinner child stems than parents.
+  - If stronger or continuous decay with depth is desired, a custom rule (e.g., `thickness_<id> *= alpha^depth`) can be added in generation or as a prior in fitting.
