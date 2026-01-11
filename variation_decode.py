@@ -188,6 +188,199 @@ def _export_instance_meshes(
         filename = f"{node_id}_{class_name}.{file_ext}"
         save_mesh(mesh, os.path.join(class_dir, filename), write_uvs=write_uvs)
 
+def _infer_fruit_texture(obj_path: str) -> str:
+    base, _ = os.path.splitext(obj_path)
+    mtl_path = f"{base}.mtl"
+    if os.path.isfile(mtl_path):
+        with open(mtl_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.lower().startswith("map_kd"):
+                    parts = line.split(maxsplit=1)
+                    if len(parts) == 2:
+                        texture_path = parts[1].strip().strip('"')
+                        if not os.path.isabs(texture_path):
+                            texture_path = os.path.join(os.path.dirname(mtl_path), texture_path)
+                        if os.path.isfile(texture_path):
+                            return texture_path
+
+    obj_dir = os.path.dirname(obj_path)
+    for name in sorted(os.listdir(obj_dir)):
+        if name.lower().endswith((".png", ".jpg", ".jpeg")):
+            return os.path.join(obj_dir, name)
+    return ""
+
+def _parse_obj_mesh(path: str) -> o3d.geometry.TriangleMesh:
+    vertices = []
+    uvs = []
+    triangles = []
+    triangle_uvs = []
+    have_uvs = True
+
+    def _fix_index(idx: int, size: int) -> int:
+        return idx - 1 if idx > 0 else size + idx
+
+    with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("v "):
+                parts = line.split()
+                if len(parts) >= 4:
+                    vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            elif line.startswith("vt "):
+                parts = line.split()
+                if len(parts) >= 3:
+                    uvs.append([float(parts[1]), float(parts[2])])
+            elif line.startswith("f "):
+                parts = line.split()[1:]
+                if len(parts) < 3:
+                    continue
+                face = []
+                face_uv = []
+                for token in parts:
+                    vals = token.split("/")
+                    if not vals[0]:
+                        continue
+                    vi = _fix_index(int(vals[0]), len(vertices))
+                    face.append(vi)
+                    if len(vals) > 1 and vals[1]:
+                        vti = _fix_index(int(vals[1]), len(uvs))
+                        face_uv.append(vti)
+                    else:
+                        have_uvs = False
+                for i in range(1, len(face) - 1):
+                    tri = [face[0], face[i], face[i + 1]]
+                    triangles.append(tri)
+                    if have_uvs and len(face_uv) == len(face):
+                        tri_uv = [face_uv[0], face_uv[i], face_uv[i + 1]]
+                        for uv_idx in tri_uv:
+                            triangle_uvs.append(uvs[uv_idx])
+                    else:
+                        have_uvs = False
+
+    mesh = o3d.geometry.TriangleMesh()
+    if vertices and triangles:
+        mesh.vertices = o3d.utility.Vector3dVector(np.array(vertices, dtype=np.float64))
+        mesh.triangles = o3d.utility.Vector3iVector(np.array(triangles, dtype=np.int32))
+        if have_uvs and len(triangle_uvs) == len(triangles) * 3:
+            mesh.triangle_uvs = o3d.utility.Vector2dVector(
+                np.array(triangle_uvs, dtype=np.float64)
+            )
+        mesh.compute_vertex_normals()
+    return mesh
+
+
+def _load_fruit_mesh(path: str) -> Tuple[o3d.geometry.TriangleMesh, str]:
+    if not path:
+        raise ValueError("Fruit mesh path is empty.")
+    path = os.path.abspath(path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Fruit mesh not found: {path}")
+    mesh = o3d.io.read_triangle_mesh(path, enable_post_processing=True)
+    if mesh.is_empty():
+        mesh = o3d.io.read_triangle_mesh(path)
+    if mesh.is_empty():
+        mesh = _parse_obj_mesh(path)
+    if mesh.is_empty():
+        raise ValueError(
+            f"Fruit mesh is empty: {path}. "
+            "If the OBJ contains quads/ngons, enable_post_processing should triangulate."
+        )
+    mesh.compute_vertex_normals()
+    texture_path = _infer_fruit_texture(path)
+    if texture_path:
+        image = o3d.io.read_image(texture_path)
+        mesh.textures = [image]
+    return mesh, texture_path
+
+def _add_random_fruit_meshes(
+    meshes: Dict[str, o3d.geometry.TriangleMesh],
+    classes: Dict[str, int],
+    offsets: Dict[str, torch.Tensor],
+    plant_graph: PlantGraphFixedTopology,
+    rng: np.random.Generator,
+    fruit_per_plant: int,
+    fruit_mesh: o3d.geometry.TriangleMesh,
+    scale_k: float,
+    rotate_x_deg: float,
+) -> Tuple[Dict[str, o3d.geometry.TriangleMesh], Dict[str, int]]:
+    classes_with_fruit = dict(classes)
+    if fruit_per_plant <= 0:
+        return meshes, classes_with_fruit
+
+    main_stem = str(plant_graph.main_stem)
+    candidates = []
+    for node_id in plant_graph.stem_key:
+        parent_id = str(plant_graph.parents[str(node_id)])
+        grandparent_id = str(plant_graph.parents.get(parent_id, ""))
+        if grandparent_id == main_stem:
+            candidates.append(node_id)
+    if not candidates:
+        candidates = [
+            node_id for node_id in plant_graph.stem_key if node_id != main_stem
+        ]
+    if not candidates:
+        return meshes, classes_with_fruit
+
+    replace = fruit_per_plant > len(candidates)
+    chosen = rng.choice(candidates, size=fruit_per_plant, replace=replace)
+
+    base_mesh = fruit_mesh
+    aabb = base_mesh.get_axis_aligned_bounding_box()
+    extent = float(np.max(aabb.get_extent()))
+    if extent <= 0:
+        return meshes, classes_with_fruit
+
+    down_rotation = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, -1.0],
+        ]
+    )
+    rot_x_rad = np.deg2rad(rotate_x_deg)
+    rot_x = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, np.cos(rot_x_rad), -np.sin(rot_x_rad)],
+            [0.0, np.sin(rot_x_rad), np.cos(rot_x_rad)],
+        ]
+    )
+    total_rotation = rot_x @ down_rotation
+
+    for idx, node_id in enumerate(chosen):
+        offset = offsets.get(str(node_id))
+        if offset is None:
+            continue
+        thickness = getattr(plant_graph, f"thickness_{node_id}", None)
+        if thickness is None:
+            continue
+        parent_id = str(plant_graph.parents[str(node_id)])
+        parent_thickness = getattr(plant_graph, f"thickness_{parent_id}", None)
+        base_radius = thickness
+        if parent_thickness is not None:
+            base_radius = torch.maximum(base_radius, parent_thickness)
+        radius = float(base_radius.detach().cpu().item()) * scale_k
+        if radius <= 0.0:
+            continue
+
+        fruit = o3d.geometry.TriangleMesh(base_mesh)
+        scale = (2.0 * radius) / extent
+        fruit.scale(scale, center=(0, 0, 0))
+        fruit.rotate(total_rotation, center=(0, 0, 0))
+        fruit.translate(offset.detach().cpu().numpy())
+        fruit.compute_vertex_normals()
+
+        fruit_key = f"fruit_{node_id}_{idx}"
+        meshes[fruit_key] = fruit
+        classes_with_fruit[str(fruit_key)] = FRUIT_CLASS
+
+    return meshes, classes_with_fruit
+
 def _add_junction_node_meshes(
     meshes: Dict[str, o3d.geometry.TriangleMesh],
     classes: Dict[str, int],
@@ -246,21 +439,58 @@ def generate_variations(args: argparse.Namespace) -> None:
         )
 
         with torch.no_grad():
-            want_junction_nodes = args.output_type != "mesh" and args.add_junction_nodes
+            fruit_per_plant = int(getattr(args, "fruit_per_plant", 0))
+            fruit_obj_path = getattr(args, "fruit_obj_path", None)
+            fruit_scale_k = float(getattr(args, "fruit_scale_k", 1.0))
+            fruit_rotate_x_deg = float(getattr(args, "fruit_rotate_x_deg", 0.0))
+            want_fruit = fruit_per_plant > 0 and fruit_obj_path
+            want_junction_nodes = args.add_junction_nodes
+            want_offsets = want_junction_nodes or want_fruit
             if args.output_type == "mesh":
-                mesh = plant_graph.generate(
+                if want_offsets:
+                    meshes, _, _, offsets = plant_graph.generate(
+                        output_format="instance_mesh_full",
+                        color=args.color,
+                        align_global=args.align_global,
+                        junction_sphere_delta=args.junction_sphere_delta,
+                    )
+                    classes_for_output = dict(classes)
+                    if want_junction_nodes:
+                        meshes, classes_for_output = _add_junction_node_meshes(
+                            meshes,
+                            classes_for_output,
+                            offsets,
+                            plant_graph,
+                            radius_delta=args.junction_sphere_delta,
+                        )
+                    if want_fruit:
+                        fruit_mesh, _ = _load_fruit_mesh(fruit_obj_path)
+                        meshes, classes_for_output = _add_random_fruit_meshes(
+                            meshes,
+                            classes_for_output,
+                            offsets,
+                            plant_graph,
+                            rng=rng,
+                            fruit_per_plant=fruit_per_plant,
+                            fruit_mesh=fruit_mesh,
+                            scale_k=fruit_scale_k,
+                            rotate_x_deg=fruit_rotate_x_deg,
+                        )
+                    mesh = _merge_with_class_colors(meshes, classes_for_output)
+                else:
+                    mesh = plant_graph.generate(
                     output_format="mesh",
                     color=args.color,
                     align_global=args.align_global,
                     junction_sphere_delta=args.junction_sphere_delta,
-                )
+                    )
                 output_name = f"{args.output_prepend}_{args.sample_name}_variation_{idx:02d}.ply"
                 save_mesh(mesh, os.path.join(args.output_dir, output_name))
                 if args.visualize:
                     axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.01)
                     o3d.visualization.draw_geometries([mesh, axis], mesh_show_back_face=True)
             else:
-                if want_junction_nodes:
+                if want_offsets:
                     meshes, _, _, offsets = plant_graph.generate(
                         output_format="instance_mesh_full",
                         color=args.color,
@@ -282,6 +512,19 @@ def generate_variations(args: argparse.Namespace) -> None:
                         offsets,
                         plant_graph,
                         radius_delta=args.junction_sphere_delta,
+                    )
+                if want_fruit:
+                    fruit_mesh, fruit_texture = _load_fruit_mesh(fruit_obj_path)
+                    meshes, classes_for_output = _add_random_fruit_meshes(
+                        meshes,
+                        classes_for_output,
+                        offsets,
+                        plant_graph,
+                        rng=rng,
+                        fruit_per_plant=fruit_per_plant,
+                        fruit_mesh=fruit_mesh,
+                        scale_k=fruit_scale_k,
+                        rotate_x_deg=fruit_rotate_x_deg,
                     )
                 if args.texturise:
                     if args.leaf_texture is None or not os.path.isdir(args.leaf_texture):
@@ -324,8 +567,9 @@ def generate_variations(args: argparse.Namespace) -> None:
                     inst_dir = os.path.join(
                         args.output_dir, f"{args.output_prepend}_{args.sample_name}_variation_{idx:02d}", "instances"
                     )
+                    want_obj = bool(args.texturise) or (want_fruit and fruit_texture)
                     # If textured, export OBJ with UVs; otherwise use PLY
-                    if args.texturise:
+                    if want_obj:
                         _export_instance_meshes(meshes, classes_for_output, inst_dir, write_uvs=True, file_ext="obj")
                     else:
                         _export_instance_meshes(meshes, classes_for_output, inst_dir, write_uvs=False, file_ext="ply")
@@ -389,6 +633,10 @@ def parse_args() -> argparse.Namespace:
         default=today,
         help="Prefix prepended to every exported variation (default: today's date, YYYYMMDD).",
     )
+    parser.add_argument("--fruit_obj_path", type=str, default=None, help="Path to an OBJ mesh used for fruit instances.")
+    parser.add_argument("--fruit_per_plant", type=int, default=0, help="Number of fruit instances to add per plant.")
+    parser.add_argument("--fruit_scale_k", type=float, default=1.0, help="Fruit scale multiplier applied to stem thickness.")
+    parser.add_argument("--fruit_rotate_x_deg", type=float, default=0.0, help="Additional fruit rotation around X axis (deg).")
     return parser.parse_args()
 
 
