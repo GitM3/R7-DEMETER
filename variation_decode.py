@@ -15,11 +15,14 @@ from utils.graph import load_class, load_parent
 from utils.pca import NodePCA
 from utils.texturing import attach_uv_to_grid_mesh
 
+NODE_CLASS = 99
+
 CLASS_COLOR_MAP = {
     STEM_CLASS: (0.55, 0.33, 0.1),
     LEAF_CLASS: (0.12, 0.6, 0.2),
     FLOWER_CLASS: (0.9, 0.4, 0.7),
     FRUIT_CLASS: (0.3, 0.6, 0.2),
+    NODE_CLASS: (0.7, 0.7, 0.7),
 }
 
 CLASS_NAME_MAP = {
@@ -27,6 +30,7 @@ CLASS_NAME_MAP = {
     LEAF_CLASS: "leaf",
     FLOWER_CLASS: "flower",
     FRUIT_CLASS: "fruit",
+    NODE_CLASS: "node",
 }
 
 
@@ -184,6 +188,44 @@ def _export_instance_meshes(
         filename = f"{node_id}_{class_name}.{file_ext}"
         save_mesh(mesh, os.path.join(class_dir, filename), write_uvs=write_uvs)
 
+def _add_junction_node_meshes(
+    meshes: Dict[str, o3d.geometry.TriangleMesh],
+    classes: Dict[str, int],
+    offsets: Dict[str, torch.Tensor],
+    plant_graph: PlantGraphFixedTopology,
+    radius_delta: float,
+) -> Tuple[Dict[str, o3d.geometry.TriangleMesh], Dict[str, int]]:
+    classes_with_nodes = dict(classes)
+    parent_map = plant_graph.parents
+    main_stem = plant_graph.main_stem
+
+    for node_id in plant_graph.stem_key:
+        if node_id == main_stem:
+            continue
+        offset = offsets.get(node_id)
+        if offset is None:
+            continue
+        thickness = getattr(plant_graph, f"thickness_{node_id}", None)
+        if thickness is None:
+            continue
+        parent_id = str(parent_map[node_id])
+        parent_thickness = getattr(plant_graph, f"thickness_{parent_id}", None)
+        base_radius = thickness
+        if parent_thickness is not None:
+            base_radius = torch.maximum(base_radius, parent_thickness)
+            radius = float(base_radius.detach().cpu().item())
+            radius *= (1.0 + radius_delta / 100.0)
+            if radius <= 0.0:
+                continue
+        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius, resolution=12)
+        sphere.translate(offset.detach().cpu().numpy())
+        sphere.compute_vertex_normals()
+        node_key = f"node_{node_id}"
+        meshes[node_key] = sphere
+        classes_with_nodes[str(node_key)] = NODE_CLASS
+
+    return meshes, classes_with_nodes
+
 def generate_variations(args: argparse.Namespace) -> None:
     rng = np.random.default_rng(args.seed)
     plant_graph, pca_models, classes = _load_graph(args.data_folder, args.species, args.sample_name)
@@ -204,11 +246,13 @@ def generate_variations(args: argparse.Namespace) -> None:
         )
 
         with torch.no_grad():
+            want_junction_nodes = args.output_type != "mesh" and args.add_junction_nodes
             if args.output_type == "mesh":
                 mesh = plant_graph.generate(
                     output_format="mesh",
                     color=args.color,
                     align_global=args.align_global,
+                    junction_sphere_delta=args.junction_sphere_delta,
                 )
                 output_name = f"{args.output_prepend}_{args.sample_name}_variation_{idx:02d}.ply"
                 save_mesh(mesh, os.path.join(args.output_dir, output_name))
@@ -216,11 +260,29 @@ def generate_variations(args: argparse.Namespace) -> None:
                     axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.01)
                     o3d.visualization.draw_geometries([mesh, axis], mesh_show_back_face=True)
             else:
-                meshes = plant_graph.generate(
-                    output_format="instance_mesh",
-                    color=args.color,
-                    align_global=args.align_global,
-                )
+                if want_junction_nodes:
+                    meshes, _, _, offsets = plant_graph.generate(
+                        output_format="instance_mesh_full",
+                        color=args.color,
+                        align_global=args.align_global,
+                        junction_sphere_delta=args.junction_sphere_delta,
+                    )
+                else:
+                    meshes = plant_graph.generate(
+                        output_format="instance_mesh",
+                        color=args.color,
+                        align_global=args.align_global,
+                        junction_sphere_delta=args.junction_sphere_delta,
+                    )
+                classes_for_output = dict(classes)
+                if want_junction_nodes:
+                    meshes, classes_for_output = _add_junction_node_meshes(
+                        meshes,
+                        classes_for_output,
+                        offsets,
+                        plant_graph,
+                        radius_delta=args.junction_sphere_delta,
+                    )
                 if args.texturise:
                     if args.leaf_texture is None or not os.path.isdir(args.leaf_texture):
                         raise FileNotFoundError("--texturise requires a valid folder path for --leaf_texture")
@@ -232,7 +294,7 @@ def generate_variations(args: argparse.Namespace) -> None:
                         raise FileNotFoundError(f"No image files found in folder: {args.leaf_texture}")
 
                     for node_id, mesh in meshes.items():
-                        class_idx = classes.get(str(node_id))
+                        class_idx = classes_for_output.get(str(node_id))
                         if class_idx == LEAF_CLASS:
                             chosen_texture_path = random.choice(image_paths)
                             print(f"[TEXTURE] Using random leaf texture: {chosen_texture_path}")
@@ -252,7 +314,7 @@ def generate_variations(args: argparse.Namespace) -> None:
                                 )
                         mesh.compute_vertex_normals()
                 if args.output_type == "color_mesh":
-                    mesh = _merge_with_class_colors(meshes, classes)
+                    mesh = _merge_with_class_colors(meshes, classes_for_output)
                     output_name = f"{args.output_prepend}_color_{args.sample_name}_variation_{idx:02d}_color.ply"
                     save_mesh(mesh, os.path.join(args.output_dir, output_name))
                     if args.visualize:
@@ -264,9 +326,9 @@ def generate_variations(args: argparse.Namespace) -> None:
                     )
                     # If textured, export OBJ with UVs; otherwise use PLY
                     if args.texturise:
-                        _export_instance_meshes(meshes, classes, inst_dir, write_uvs=True, file_ext="obj")
+                        _export_instance_meshes(meshes, classes_for_output, inst_dir, write_uvs=True, file_ext="obj")
                     else:
-                        _export_instance_meshes(meshes, classes, inst_dir, write_uvs=False, file_ext="ply")
+                        _export_instance_meshes(meshes, classes_for_output, inst_dir, write_uvs=False, file_ext="ply")
                     if args.visualize:
                         o3d.visualization.draw_geometries(
                             list(meshes.values()), mesh_show_back_face=True
@@ -305,6 +367,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--draw_graph", action="store_true", help="Print plant hierarchy information.")
     parser.add_argument("--visualize", action="store_true", help="Open an interactive viewer for each variation.")
     parser.add_argument("--color", type=str, default="gray", help="Mesh color mode passed to PlantGraph.generate.")
+    parser.add_argument(
+        "--junction_sphere_delta",
+        type=float,
+        default=0.0,
+        help="Percent increase over stem thickness for junction spheres (e.g. 2 = +2%).",
+    )
+    parser.add_argument(
+        "--add_junction_nodes",
+        action="store_true",
+        help="Export junction spheres as separate 'node' instances (instance_mesh/color_mesh only).",
+    )
     parser.add_argument("--texturise", action="store_true", help="Apply a single texture to all leaf instance meshes.")
     parser.add_argument("--leaf_texture", type=str, default=None, help="Path to leaf texture images used when --texturise is set.")
     parser.add_argument("--leaf_texture_flip_u", action="store_true", help="Mirror texture horizontally on leaves.")

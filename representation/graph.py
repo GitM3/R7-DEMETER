@@ -237,6 +237,8 @@ class PlantGraphFixedTopology(nn.Module):
         leaf_deform_blend_weight = kwargs.get('leaf_deform_blend_weight', 1.0)
         max_processed = kwargs.get('max_processed', 1000)
         edit_id = kwargs.get('edit_id', -1)
+        junction_spheres = kwargs.get('junction_spheres', False)
+        junction_sphere_delta = float(kwargs.get('junction_sphere_delta', 0.0))
 
 
         layers = self.layers
@@ -375,6 +377,23 @@ class PlantGraphFixedTopology(nn.Module):
                                 p_mesh = grid_to_mesh(p_viz, color='orange')
                             else:
                                 p_mesh = grid_to_mesh(p_viz, color=color)
+                        if junction_spheres and child_k != main_stem:
+                            base_radius = thickness
+                            parent_thickness = getattr(self, f"thickness_{xp}", None)
+                            if parent_thickness is not None:
+                                base_radius = torch.maximum(base_radius, parent_thickness)
+                            sphere_radius = float(base_radius.detach().cpu().item())
+                            sphere_radius *= (1.0 + junction_sphere_delta / 100.0)
+                            if sphere_radius > 0.0:
+                                sphere = o3d.geometry.TriangleMesh.create_sphere(
+                                    radius=sphere_radius, resolution=12
+                                )
+                                sphere.translate(offset.detach().cpu().numpy())
+                                if p_mesh.has_vertex_colors():
+                                    sphere.paint_uniform_color(
+                                        np.mean(np.asarray(p_mesh.vertex_colors), axis=0)
+                                    )
+                                p_mesh += sphere
                         geometries.append(p_mesh)
                         geometries_dict[child_k] = p_mesh
                         geometries_M_p_dict[child_k] = M_p
