@@ -34,6 +34,13 @@ def build_run_args(
         draw_graph=False,
         visualize=base_args.visualize,
         color=base_args.color,
+        texturise=base_args.texturise,
+        leaf_texture=base_args.leaf_texture,
+        leaf_texture_flip_u=base_args.leaf_texture_flip_u,
+        leaf_texture_flip_v=base_args.leaf_texture_flip_v,
+        leaf_texture_rotate_deg=base_args.leaf_texture_rotate_deg,
+        add_junction_nodes=base_args.add_junction_nodes,
+        junction_sphere_delta=base_args.junction_sphere_delta,
         output_prepend=output_prepend,
     )
 
@@ -61,6 +68,13 @@ def main():
     parser.add_argument("--align_global", action="store_true")
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--color", type=str, default="gray")
+    parser.add_argument("--texturise", action="store_true")
+    parser.add_argument("--leaf_texture", type=str, default=None)
+    parser.add_argument("--leaf_texture_flip_u", action="store_true")
+    parser.add_argument("--leaf_texture_flip_v", action="store_true")
+    parser.add_argument("--leaf_texture_rotate_deg", type=int, default=0, choices=[0, 90, 180, 270])
+    parser.add_argument("--add_junction_nodes", action="store_true")
+    parser.add_argument("--junction_sphere_delta", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=None, help="Base seed; batches increment this value.")
     args = parser.parse_args()
 
