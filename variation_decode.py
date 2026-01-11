@@ -1,5 +1,7 @@
 import argparse
+import random
 import os
+import glob
 from datetime import datetime
 from typing import Dict, Tuple
 
@@ -182,7 +184,6 @@ def _export_instance_meshes(
         filename = f"{node_id}_{class_name}.{file_ext}"
         save_mesh(mesh, os.path.join(class_dir, filename), write_uvs=write_uvs)
 
-
 def generate_variations(args: argparse.Namespace) -> None:
     rng = np.random.default_rng(args.seed)
     plant_graph, pca_models, classes = _load_graph(args.data_folder, args.species, args.sample_name)
@@ -221,12 +222,22 @@ def generate_variations(args: argparse.Namespace) -> None:
                     align_global=args.align_global,
                 )
                 if args.texturise:
-                    if args.leaf_texture is None or not os.path.isfile(args.leaf_texture):
-                        raise FileNotFoundError("--texturise requires a valid --leaf_texture path")
-                    img = o3d.io.read_image(args.leaf_texture)
+                    if args.leaf_texture is None or not os.path.isdir(args.leaf_texture):
+                        raise FileNotFoundError("--texturise requires a valid folder path for --leaf_texture")
+
+                    image_paths = glob.glob(os.path.join(args.leaf_texture, "*.*"))
+                    image_paths = [p for p in image_paths if p.lower().endswith((".png", ".jpg", ".jpeg"))]
+
+                    if len(image_paths) == 0:
+                        raise FileNotFoundError(f"No image files found in folder: {args.leaf_texture}")
+
                     for node_id, mesh in meshes.items():
                         class_idx = classes.get(str(node_id))
                         if class_idx == LEAF_CLASS:
+                            chosen_texture_path = random.choice(image_paths)
+                            print(f"[TEXTURE] Using random leaf texture: {chosen_texture_path}")
+
+                            img = o3d.io.read_image(chosen_texture_path)
                             attach_uv_to_grid_mesh(
                                 mesh,
                                 (plant_graph.leaf_w, plant_graph.leaf_h),
@@ -295,7 +306,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visualize", action="store_true", help="Open an interactive viewer for each variation.")
     parser.add_argument("--color", type=str, default="gray", help="Mesh color mode passed to PlantGraph.generate.")
     parser.add_argument("--texturise", action="store_true", help="Apply a single texture to all leaf instance meshes.")
-    parser.add_argument("--leaf_texture", type=str, default=None, help="Path to a leaf texture image (png/jpg) used when --texturise is set.")
+    parser.add_argument("--leaf_texture", type=str, default=None, help="Path to leaf texture images used when --texturise is set.")
     parser.add_argument("--leaf_texture_flip_u", action="store_true", help="Mirror texture horizontally on leaves.")
     parser.add_argument("--leaf_texture_flip_v", action="store_true", help="Mirror texture vertically on leaves.")
     parser.add_argument("--leaf_texture_rotate_deg", type=int, default=0, choices=[0, 90, 180, 270], help="Rotate leaf texture UVs clockwise (deg).")
