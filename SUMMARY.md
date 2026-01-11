@@ -156,3 +156,130 @@ Variation test bench example:
     --leaf_shape_scale_start 0.4 --leaf_shape_scale_step 0.2 \
     --output_type color_mesh --align_global
 ```
+
+## Usage Cheatsheet (Quick)
+- Decode fitted parameters to mesh:
+  - `python decode.py --data_folder sample_params --sample_name 24_o --species soybean`
+  - Species examples: `ribes:08`, `maize:10008da`, `tobacco:1`, `rose:02`.
+- Reconstruct from a raw point cloud (3 steps):
+  - Normalize and annotate axis: `python script_reconstruction/process_data.py --point_path sample_point_cloud/val/65_i/pcd.ply`
+  - Run PointTransformer-V3 inference (see `script_reconstruction/readme.md`), then copy `normalized_pcd_pred.npy` and `normalized_pcd_pred_dist.npy` into the same folder.
+  - Fit graph and export mesh: `python script_reconstruction/recon.py --data_folder sample_point_cloud/val/65_i --species soybean`
+
+## Adding Fruit Class (Placeholder 3D Object)
+- Current state:
+  - `FRUIT_CLASS` exists (`utils/constant.py`) and is used for topology coloring (`utils/plot.draw_tree_with_colors`).
+  - Geometry pipeline skips fruit nodes in both graph assembly and decoding: see `representation/build_graph.py` and `representation/graph.py` where fruit/flower nodes are filtered out.
+- Goal (minimal viable): Render fruits as simple spheres/ellipsoids attached along parent stems, with per-node transform and scale, without PCA.
+
+### Required Code Changes (minimal scope)
+- `representation/graph.py` (PlantGraphFixedTopology)
+  - Include fruit nodes:
+    - Constructor: stop skipping `FRUIT_CLASS` when collecting node keys; add `self.fruit_key` list similar to `leaf_key`.
+    - Parameter registration for fruits: per-node `scale_<id>`, `M_quat_<id>`, and `length_<id>` (reuse existing length-along-parent). Optionally `radius_<id>` if you want radius separate from scale.
+    - `__len__`: include `len(self.fruit_key)` in the count.
+  - Geometry generation:
+    - In `generate(...)` processing loop, add a branch for `FRUIT_CLASS` to create a placeholder mesh:
+      - Compute `s`, `M`, `M_p`, and `offset` exactly as for leaves.
+      - Build a mesh: `o3d.geometry.TriangleMesh.create_sphere(radius)` (or a small UV-sphere), then apply `.scale(float(s), center=(0,0,0))`, `.rotate((M @ M_p).detach().cpu().numpy(), center=(0,0,0))` and `.translate(offset.detach().cpu().numpy())`.
+      - Add to `geometries`, `geometries_dict`, and support `output_format` options `mesh` and `instance_mesh`. For `point` output, sample sphere vertices as points.
+
+- `representation/build_graph.py`
+  - Stop filtering fruit/flower children when forming `cur_layer_child_connected_template_pcd`. Fruits must be considered to compute `node_length_along_parent_stem`.
+  - For fruit nodes, compute attachment length and local frame using the parent stem:
+    - Length: use the index of the closest parent-stem point to the fruit center, normalized by `(len(parent_curve)-1)`, mirroring the leaf case.
+    - Orientation `M_quat`: use the parent’s Frenet frame at that index (same as stems/leaves), or identity if a simpler placeholder is preferred.
+    - Size: set a default `radius` (e.g., `0.003`) or estimate from the fruit cluster as the 90–95th percentile of distances to the cluster centroid.
+  - Extend the info dicts passed to `PlantGraphFixedTopology` with a fruit edict (e.g., `fruit_info_radius`, `fruit_info_s`, `fruit_info_M_quat`), and ensure `node_length_along_parent_stem` includes fruit entries.
+
+- `script_reconstruction/recon.py`
+  - Semantics → classes already maps predicted `fruit` to `FRUIT_CLASS`.
+  - Add a minimal “fit” branch for fruit (no optimization):
+    - For each fruit cluster, compute centroid and radius estimate; write a placeholder PCD to `fit/<id>.ply` so downstream code can reference it like other parts.
+    - Add the centroid cloud to `template_points`/`connected_template_pcd` so `build_graph` can compute the parent attachment index uniformly.
+
+### Graph/Topology Adjustments
+- `info/class.txt`: continue to encode fruit nodes with class id `3` (already in use).
+- `info/parent.txt`: no change to format; fruit nodes should attach to stems. `utils/graph.get_guessed_parent(...)` already allows non-stem classes to be children; it biases edges to/from stems.
+- Visualization: `utils/plot.draw_tree_with_colors` already colors fruit dark green; topology plots will include fruit nodes once they are not filtered out in `build_graph.py`.
+
+### Code Pointers To Modify
+- Decode/rendering:
+  - `representation/graph.py`:
+    - Class: `PlantGraphFixedTopology` (collection of node keys, parameter registration, and the main `generate` loop where fruit handling should be added).
+    - Look for blocks that `continue` on `FLOWER_CLASS` or `FRUIT_CLASS` and remove/branch accordingly.
+- Topology assembly:
+  - `representation/build_graph.py`:
+    - The layer loop that builds `cur_layer_child_connected_template_pcd` and computes `node_length_along_parent_stem[...]` using parent-stem points.
+    - The block that transforms child-local parameters into parent-local frames (add a fruit case mirroring leaf but using centroid + radius).
+- Reconstruction entry:
+  - `script_reconstruction/recon.py`:
+    - The per-class fitting loop: add a simple branch for `FRUIT_CLASS` that computes centroid/radius, writes `fit/*.ply`, and updates `template_points`.
+
+### Suggested Incremental Plan
+- Phase 1 (decode-only): Implement fruit handling in `representation/graph.py` and manually add fruit parameters to an existing `graph.pkl` for testing (e.g., pick a leaf node id, duplicate parameters with fruit class). Verify `mesh`/`instance_mesh` output renders spheres.
+- Phase 2 (graph build): Update `representation/build_graph.py` to compute fruit attachments and register fruit parameters into the saved `graph.pkl`.
+- Phase 3 (reconstruction): Teach `script_reconstruction/recon.py` to emit fruit placeholders into `fit/` and `template_points`, so end-to-end reconstruction includes fruit nodes by default.
+
+### Open Questions / Defaults
+- Radius choice: fixed constant vs. per-fruit estimation from cluster spread. Start with a small fixed radius (e.g., 0.003 in normalized units) for stability.
+- Segmentation outputs: `seg_mesh` currently returns two meshes (stem/leaf). Options: keep as-is, or extend to a 3-way return to include fruit.
+- Performance: Fruit placeholders are cheap; no PCA involved. Keep fruit parameters out of optimization loops unless fruit fitting is later added.
+
+## Summary
+- Usage: decode and reconstruction commands are confirmed above; PointTransformer inference is required for reconstruction.
+- Fruit support: constants and topology coloring exist, but geometry is skipped. To add fruit placeholders, wire fruit nodes into `PlantGraphFixedTopology.generate`, include them in `build_graph` length/orientation computations, and optionally add a simple centroid+radius placeholder during reconstruction. The file/function pointers above target the exact spots to change.
+
+## PCA Role In Generation (Deep Dive)
+- Purpose: PCA provides low-dimensional, species-level bases to reconstruct per-node geometry from compact coefficients.
+  - Stem 3D PCA: basis over Catmull–Rom curve control points; decoded to `[n_cp, 3]` local curve control points, then scaled/rotated and attached, finally meshed as cylinders.
+  - Leaf 2D PCA: basis over a flattened leaf template (2D grid). Coefficients (`shape_<id>`) modulate intrinsic 2D leaf outline; scaled by per-species `2d_leaf_pca_sigma.txt` during evaluation.
+  - Leaf 3D PCA: basis over 3D deformations on the mean 2D leaf. The decoded field is inverted to rotation parameters for `CatmullRomSurface` and applied to lift the 2D template into 3D.
+
+- Where it happens (generation):
+  - `representation/graph.PlantGraphFixedTopology.generate()` calls:
+    - `coeff_to_stem(deform_<id>)` → `pca_stem_3d.decode(...) → cp` → scale/rotate/attach → cylinder mesh.
+    - `coeff_to_leaf(shape_<id>, deform_<id>)` → `pca_leaf_3d.decode(...) → _surface.invert(...) → _surface.evaluate(..., shape_coeff=shape_<id>)` → scale/attach → grid mesh.
+  - Articulation is separate from PCA: `scale_<id>`, `M_quat_<id>` (orientation), `length_<id>` (attachment along parent stem) position parts in the plant frame.
+  - Thickness is explicit for stems (`thickness_<id>`) and is not part of PCA.
+
+- How node coefficients are obtained (reconstruction):
+  - In `representation/build_graph.build_plant_graph(...)` each fitted part is expressed in canonical local coordinates and encoded via the corresponding PCA:
+    - Stems: encode the local curve control points → `stem_3d_info_deform_coeff` → becomes `deform_<id>`.
+    - Leaves: encode the mean 3D grid → `leaf_3d_info_deform_coeff` (`deform_<id>`); the surface’s `dw` provides the 2D `leaf_3d_info_shape_coeff` (`shape_<id>`).
+  - These per-node coefficient tensors are registered as parameters on `PlantGraphFixedTopology`.
+
+- Scope of PCA models:
+  - PCA models are global per species, stored under `sample_params/<species>/` (`3d_stem_pca.pth`, `3d_leaf_pca.pth`, `2d_leaf_pca.pth`).
+  - There is no per-node or per-plant PCA “cluster”. Each node stores its own coefficient vector in the shared species PCA basis.
+  - `utils/pca.NodePCA` buffers include `data_mean`, `components`, and optionally `coeff_mean`/`coeff_std` (used by our variation tools for sampling).
+
+- Sampling / variation:
+  - `variation_decode.py` samples coefficients as `base + N(0, scale) * coeff_std`, where `base` is the PCA mean (`mean` strategy) or the fitted node’s current value (`perturb`).
+  - `graph_editor.py` mirrors this when adding a node: articulation is cloned from a source node, while PCA coefficients for the new node (stem `deform`, leaf `deform` + `shape`) are resampled.
+
+- Practical implications:
+  - Edit PCA coefficients to change intrinsic shape; edit articulation (scale/rotation/length) to change placement.
+  - If a PCA `.pth` lacks `coeff_mean/coeff_std`, decoding works but stochastic sampling should be avoided or the stats estimated offline.
+
+## Articulation Parameters (What, Where, How)
+- Parameters (per node, stored as Torch nn.Parameters on `PlantGraphFixedTopology`):
+  - `scale_<id>`: scalar size of the part; set from reconstruction as inverse of the fitted size (`1/s` during registration), then used directly in generation to scale decoded geometry.
+  - `M_quat_<id>`: local orientation as a quaternion; maps the node’s canonical geometry to its local frame before attachment.
+  - `length_<id>`: normalized attachment location along the parent stem curve in `[0,1]`; determines the offset point and local frame sampled on the parent.
+  - Stem‑only `thickness_<id>`: cylinder radius for meshing the stem curve (not part of PCA).
+
+- Where they are registered:
+  - `representation/graph.py` (constructor `PlantGraphFixedTopology.__init__`): registers `scale_<id>`, `M_quat_<id>`, and `length_<id>` for every non‑flower/fruit node; and `thickness_<id>` for stems.
+  - Source values come from `representation/build_graph.build_plant_graph(...)`, which computes per‑node `s` (size), local orientation `M_quat`, and `node_length_along_parent_stem` during graph assembly.
+
+- How they are applied at generation time:
+  - In `PlantGraphFixedTopology.generate(...)`:
+    - Parent attachment: `length_<id>` selects a point along the parent stem polyline via `interpolate_polyline(...)`; a Frenet frame is interpolated with quaternion SLERP to create `M_p` (the parent frame at that point).
+    - Local transform: decoded part geometry is first rotated by `M_quat_<id>`, then by the parent frame `M_p`, then scaled by `scale_<id>`, then translated by the sampled offset.
+    - Stem thickness: drawn as cylinders along the stem curve using `thickness_<id>` (clamped to a small minimum), see `generate_cylinder_along_curve_batch(...)`.
+
+- Thickness/tapering behavior (stems):
+  - There is no automatic distance‑based decay. Tapering arises from the learned/stored `thickness_<id>` per node, plus a constraint during fine‑tuning:
+    - In `PlantGraphFixedTopology.fit(..., mode='finetune')`, after optimization it enforces `thickness_child <= thickness_parent` (see lines near the post‑loop update), which encourages thinner child stems than parents.
+  - If stronger or continuous decay with depth is desired, a custom rule (e.g., `thickness_<id> *= alpha^depth`) can be added in generation or as a prior in fitting.

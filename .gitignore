@@ -3,6 +3,7 @@
 variation_output/
 variation_batches/
 variation_output/*
+texture_output/*
 variation_batches/*
 *.ply
 **/*.ply

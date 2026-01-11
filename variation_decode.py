@@ -1,5 +1,7 @@
 import argparse
+import random
 import os
+import glob
 from datetime import datetime
 from typing import Dict, Tuple
 
@@ -11,6 +13,7 @@ from representation.graph import PlantGraphFixedTopology
 from utils.constant import FLOWER_CLASS, FRUIT_CLASS, LEAF_CLASS, STEM_CLASS
 from utils.graph import load_class, load_parent
 from utils.pca import NodePCA
+from utils.texturing import attach_uv_to_grid_mesh
 
 CLASS_COLOR_MAP = {
     STEM_CLASS: (0.55, 0.33, 0.1),
@@ -138,12 +141,19 @@ def randomize_graph_coefficients(
             shape_param.copy_(new_shape)
 
 
-def save_mesh(mesh: o3d.geometry.TriangleMesh, path: str) -> None:
+def save_mesh(mesh: o3d.geometry.TriangleMesh, path: str, write_uvs: bool = False) -> None:
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
     print(f"Writing mesh to {path}")
-    o3d.io.write_triangle_mesh(path, mesh, write_ascii=False, compressed=False)
+    mesh.compute_vertex_normals()
+    o3d.io.write_triangle_mesh(
+        path,
+        mesh,
+        write_ascii=False,
+        compressed=False,
+        write_triangle_uvs=write_uvs,
+    )
 
 
 def _merge_with_class_colors(
@@ -162,14 +172,17 @@ def _export_instance_meshes(
     meshes: Dict[str, o3d.geometry.TriangleMesh],
     classes: Dict[str, int],
     destination: str,
+    write_uvs: bool = False,
+    file_ext: str = "ply",
 ) -> None:
     os.makedirs(destination, exist_ok=True)
     for node_id, mesh in meshes.items():
         class_idx = classes.get(str(node_id))
         class_name = CLASS_NAME_MAP.get(class_idx, f"class_{class_idx}")
-        filename = f"{node_id}_{class_name}.ply"
-        save_mesh(mesh, os.path.join(destination, filename))
-
+        class_dir = os.path.join(destination, class_name)
+        os.makedirs(class_dir, exist_ok=True)
+        filename = f"{node_id}_{class_name}.{file_ext}"
+        save_mesh(mesh, os.path.join(class_dir, filename), write_uvs=write_uvs)
 
 def generate_variations(args: argparse.Namespace) -> None:
     rng = np.random.default_rng(args.seed)
@@ -208,6 +221,36 @@ def generate_variations(args: argparse.Namespace) -> None:
                     color=args.color,
                     align_global=args.align_global,
                 )
+                if args.texturise:
+                    if args.leaf_texture is None or not os.path.isdir(args.leaf_texture):
+                        raise FileNotFoundError("--texturise requires a valid folder path for --leaf_texture")
+
+                    image_paths = glob.glob(os.path.join(args.leaf_texture, "*.*"))
+                    image_paths = [p for p in image_paths if p.lower().endswith((".png", ".jpg", ".jpeg"))]
+
+                    if len(image_paths) == 0:
+                        raise FileNotFoundError(f"No image files found in folder: {args.leaf_texture}")
+
+                    for node_id, mesh in meshes.items():
+                        class_idx = classes.get(str(node_id))
+                        if class_idx == LEAF_CLASS:
+                            chosen_texture_path = random.choice(image_paths)
+                            print(f"[TEXTURE] Using random leaf texture: {chosen_texture_path}")
+
+                            img = o3d.io.read_image(chosen_texture_path)
+                            attach_uv_to_grid_mesh(
+                                mesh,
+                                (plant_graph.leaf_w, plant_graph.leaf_h),
+                                flip_u=args.leaf_texture_flip_u,
+                                flip_v=args.leaf_texture_flip_v,
+                                rotate_deg=args.leaf_texture_rotate_deg,
+                            )
+                            mesh.textures = [img]
+                            if len(mesh.triangle_material_ids) == 0:
+                                mesh.triangle_material_ids = o3d.utility.IntVector(
+                                    np.zeros(len(mesh.triangles), dtype=np.int32)
+                                )
+                        mesh.compute_vertex_normals()
                 if args.output_type == "color_mesh":
                     mesh = _merge_with_class_colors(meshes, classes)
                     output_name = f"{args.output_prepend}_color_{args.sample_name}_variation_{idx:02d}_color.ply"
@@ -219,7 +262,11 @@ def generate_variations(args: argparse.Namespace) -> None:
                     inst_dir = os.path.join(
                         args.output_dir, f"{args.output_prepend}_{args.sample_name}_variation_{idx:02d}", "instances"
                     )
-                    _export_instance_meshes(meshes, classes, inst_dir)
+                    # If textured, export OBJ with UVs; otherwise use PLY
+                    if args.texturise:
+                        _export_instance_meshes(meshes, classes, inst_dir, write_uvs=True, file_ext="obj")
+                    else:
+                        _export_instance_meshes(meshes, classes, inst_dir, write_uvs=False, file_ext="ply")
                     if args.visualize:
                         o3d.visualization.draw_geometries(
                             list(meshes.values()), mesh_show_back_face=True
@@ -258,6 +305,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--draw_graph", action="store_true", help="Print plant hierarchy information.")
     parser.add_argument("--visualize", action="store_true", help="Open an interactive viewer for each variation.")
     parser.add_argument("--color", type=str, default="gray", help="Mesh color mode passed to PlantGraph.generate.")
+    parser.add_argument("--texturise", action="store_true", help="Apply a single texture to all leaf instance meshes.")
+    parser.add_argument("--leaf_texture", type=str, default=None, help="Path to leaf texture images used when --texturise is set.")
+    parser.add_argument("--leaf_texture_flip_u", action="store_true", help="Mirror texture horizontally on leaves.")
+    parser.add_argument("--leaf_texture_flip_v", action="store_true", help="Mirror texture vertically on leaves.")
+    parser.add_argument("--leaf_texture_rotate_deg", type=int, default=0, choices=[0, 90, 180, 270], help="Rotate leaf texture UVs clockwise (deg).")
     parser.add_argument(
         "--output_prepend",
         type=str,
