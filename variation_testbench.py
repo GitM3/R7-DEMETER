@@ -1,5 +1,6 @@
 import argparse
 import os
+import shutil
 from datetime import datetime
 
 from variation_decode import generate_variations
@@ -41,6 +42,10 @@ def build_run_args(
         leaf_texture_rotate_deg=base_args.leaf_texture_rotate_deg,
         add_junction_nodes=base_args.add_junction_nodes,
         junction_sphere_delta=base_args.junction_sphere_delta,
+        fruit_obj_path=base_args.fruit_obj_path,
+        fruit_per_plant=base_args.fruit_per_plant,
+        fruit_scale_k=base_args.fruit_scale_k,
+        fruit_rotate_x_deg=base_args.fruit_rotate_x_deg,
         output_prepend=output_prepend,
     )
 
@@ -49,7 +54,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate batches of plant variations with progressively larger perturbations."
     )
-    today = datetime.now().strftime("%Y%m%d")
+    today = datetime.now().strftime("%Y_%m_%d")
     parser.add_argument("--data_folder", type=str, default="sample_params")
     parser.add_argument("--species", type=str, default="soybean")
     parser.add_argument("--sample_name", type=str, help="Single sample to process. If omitted, run across all available samples.")
@@ -75,10 +80,17 @@ def main():
     parser.add_argument("--leaf_texture_rotate_deg", type=int, default=0, choices=[0, 90, 180, 270])
     parser.add_argument("--add_junction_nodes", action="store_true")
     parser.add_argument("--junction_sphere_delta", type=float, default=0.0)
+    parser.add_argument("--fruit_obj_path", type=str, default=None)
+    parser.add_argument("--fruit_per_plant", type=int, default=0)
+    parser.add_argument("--fruit_scale_k", type=float, default=1.0)
+    parser.add_argument("--fruit_rotate_x_deg", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=None, help="Base seed; batches increment this value.")
     args = parser.parse_args()
 
-    os.makedirs(args.output_root, exist_ok=True)
+    dated_output_root = os.path.join(args.output_root, today)
+    if os.path.isdir(dated_output_root):
+        shutil.rmtree(dated_output_root)
+    os.makedirs(dated_output_root, exist_ok=True)
 
     instances_dir = os.path.join(args.data_folder, args.species, "instances")
     if args.sample_name:
@@ -93,7 +105,7 @@ def main():
             raise RuntimeError(f"No samples found under {instances_dir}")
 
     for sample_idx, sample_name in enumerate(sample_names):
-        sample_output_root = os.path.join(args.output_root, sample_name)
+        sample_output_root = os.path.join(dated_output_root, sample_name)
         os.makedirs(sample_output_root, exist_ok=True)
         seed_offset = 0 if args.seed is None else sample_idx * args.num_batches
         print(f"=== Processing sample '{sample_name}' ===")
